@@ -2,6 +2,4 @@
 This github repository contains scripts use to analyze TagSequencing data generated 
 from gill and liver of four populations of fishes. This raw sequencing data is publically 
 available on NCBI under BioProject PRJNA1051660.  This includes scripts used for:
-- Quality control of sequencing reads 
-- Read mapping and quantification 
 - R script used for differentail gene expression analysis 
