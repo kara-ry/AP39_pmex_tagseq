@@ -1,0 +1,1941 @@
+---
+title: "TagSeq_reanalysis"
+author: "Kara Ryan"
+date: "2025-05-27"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r libs, echo=F}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(DESeq2)
+library(ggplot2)
+library(VennDiagram)
+library(topGO)
+library(gridExtra)
+
+#BiocManager::install("clusterProfiler")
+#BiocManager::install("pathview")
+#BiocManager::install("enrichplot")
+library(clusterProfiler)
+```
+
+# Analysis of TagSeq data after injection with AP39
+
+### Experimental design:
+
+Injection treatments:\
+A -- control\
+B -- PBS injection control\
+D -- high AP39
+
+All factors in the analysis:\
+2 tissues\
+2 river drainages\
+2 pops per drainage\
+3 treatments per pop
+
+Separate for each tissue (L&G) and for each population (PuyS, PuyNS, TacS, TacNS) we will need:\
+Lists of DEG for A vs B (control vs PBS)\
+Lists of DEG for (A+B)/2 vs D (Control + PBS) vs AP39 injection\
+
+### Read in count and annotation data
+
+```{r input data}
+# Read in count data and annotation
+# counts <- read.table("/Users/kararyan/Documents/AP39_Tagseq/downsampled_count_M_cleaned_2_trans_removed.txt", skip = 1, header= TRUE)
+
+counts <- read.table("/Users/kararyan/Downloads/all_samples_featurecounts.reheader.mx", header= TRUE)
+
+
+#counts <- read.table("/Users/kararyan/Documents/AP39_Tagseq/Tagseq_counts_1_unstranded_ID.txt", header= TRUE)
+
+anno <- read.csv("/Users/kararyan/Documents/AP39_Tagseq/metadata3.csv", stringsAsFactors = T)
+
+
+anno<- as.data.frame(anno)
+anno$pop <- as.factor(anno$pop)
+anno$treatment <- as.factor(anno$treatment)
+anno$tissue <- as.factor(anno$tissue)
+anno %>%
+  select(tissue, pop, treatment, group) %>%
+  group_by(pop) %>%
+  group_split() %>%
+  lapply(summary)
+
+summary(anno$group)
+```
+
+
+```{r input data}
+# Make sample name the column name in the counts matrix 
+colnames(counts)<-gsub("X.","",colnames(counts))
+
+# Remove tissue swap samples
+counts %>%
+  select(-EFR22.080, -EFR22.081) -> counts
+
+# View count data
+ncol(counts)
+nrow(counts)
+tail(counts)
+head(counts)
+
+# Read in annotation data 
+Pmex_human <- read.csv('/Users/kararyan/Documents/AP39_Tagseq/Table_S2_Poecilia_mexicana_Annotations.csv', header = T)
+
+# read in human annotations 
+Pmex_human %>%
+  select(gene.ID, gene.name, Subject.sequence.ID, Protein.annotations) %>%
+  separate(col = Subject.sequence.ID, into = c("sp", "Uniprot", "Hugo_human"), sep = '\\|') %>%
+  select(-sp) %>%
+  mutate(Hugo_human = str_remove_all(Hugo_human, "_HUMAN")) -> Pmex_human
+anno
+anno %>%
+  filter(tube.id == "EFR22.108")
+```
+
+## Tissue split
+
+```{r tissue split}
+
+# filter metadata to gill tissue only 
+anno %>%
+  filter(tube.id !='EFR22.081'& tube.id != 'EFR22.080' & treatment != 'AP39.half' ) -> anno_filtered
+
+# create a list of tube.ids to keep 
+keep <- anno_filtered$tube.id
+keep
+#filter counts matrix to keep samples in gill list
+rownames(counts) <- counts$Geneid
+counts %>%
+  select(all_of(keep)) -> counts_2
+counts_2 <- counts_2[rowSums(counts_2 > 5) > 7, ]
+
+# get sample size of unfiltered data
+ncol(counts_2)
+
+# convert gill counts to a matrix
+counts_matrix <- as.matrix(counts_2)
+
+# remove tube id column and convert it to the rownames 
+anno_matrix <- as.matrix(anno_filtered[,-1])
+rownames(anno_matrix) <- anno_filtered[,1]
+
+# confirm the same number of samples in both the counts and annotation
+all(rownames(anno_matrix %in% colnames(counts_matrix)))
+# confirm the sample names are in the matrix 
+all(rownames(anno_matrix) == colnames(counts_matrix))
+
+anno
+
+dds <- DESeqDataSetFromMatrix(countData = counts_matrix, colData = anno_matrix, 
+                              design = ~ pop + treatment + tissue)
+
+dds_all <- DESeq(dds)
+
+# Use variance stabilizing transformation (VST) or rlog (vst is faster for large datasets)
+vsd <- vst(dds_all, blind = TRUE)
+
+# Create PCA plot using DESeq2's plotPCA function
+pca_data <- plotPCA(vsd, intgroup = c("tissue", "pop"), returnData = TRUE, ntop = 2500)  # change "condition" as needed
+
+# Compute % variance explained by each PC
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+anno
+pca_data %>%
+  left_join(anno, by = c("name" = "tube.id"))%>%
+  na.omit()->pca_data 
+
+pca_data
+
+# Plot with ggplot2
+fig_s1<- ggplot(pca_data, aes(PC1, PC2, color = tissue.x, shape = pop.x)) +
+  geom_point()+
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  scale_shape_manual(values = c(0,17, 15,2)) +
+  theme_minimal() +
+  labs(title = "PCA of VST-Transformed Counts (n=2,500 genes)") + 
+  guides(color=guide_legend(title="Tissue")) + 
+  guides(shape=guide_legend(title="Population"))
+
+pca_data %>%
+  arrange(PC1)
+
+#pdf("/Users/kararyan/Documents/AP39_Tagseq/FigS1.pdf")
+fig_s1
+```
+
+
+```{r}
+dds <- estimateSizeFactors(dds)
+normalized_counts <- counts(dds, normalized=TRUE)
+
+# make the results a data frame
+normalized_counts  <- as.data.frame(normalized_counts)
+# make a column of the gene names 
+normalized_counts$gene <- rownames(normalized_counts)
+# join with annotations 
+normalized_counts  %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->normalized_counts
+
+row.names(normalized_counts)
+
+normalized_counts %>%
+  filter(gene.name == "sqrdl" | gene.name == 'LOC106917689' | gene.name == 'LOC106917690') -> sqr_pathway_counts
+sqr_pathway_counts
+
+sqr_pathway_counts %>%
+  pivot_longer(!c(Protein.annotations, Hugo_human, Uniprot, gene.name, gene), names_to = "tube.id", values_to = "count") -> sqr_pathway_counts
+sqr_pathway_counts
+
+sqr_pathway_counts %>%
+  left_join(anno) -> sqr_pathway_counts
+sqr_pathway_counts %>%
+  select(!c(treatment.c, treatment.c2, habitat2, drainage2, tissue2)) -> sqr_pathway_counts
+sqr_pathway_counts
+
+
+
+```
+
+
+```{r}
+sqr_pathway_counts %>%
+         filter(gene.name == 'sqrdl') -> sqrdl
+
+sqrdl$pop.treatment <- paste(sqrdl$pop, sqrdl$treatment, sep = ".")
+color_palette <- c("s" = "gold", "ns" = "skyblue")
+
+sqrdl$fill_color <- ifelse(sqrdl$treatment == "AP39.full",
+                                  sqrdl$habitat,
+                                  NA)
+
+sqr_plot<-ggplot(sqrdl, aes(x = pop.treatment, y = count, color = habitat)) +
+  geom_boxplot() +
+  scale_color_manual(values = color_palette) +
+  facet_wrap(~tissue) +
+  theme_minimal()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ggtitle("SQR normalized counts")
+
+sqr_pathway_counts %>%
+         filter(gene.name == 'LOC106917689') -> ethe1_89
+
+ethe1_89$pop.treatment <- paste(ethe1_89$pop, ethe1_89$treatment, sep = ".")
+color_palette <- c("s" = "gold", "ns" = "skyblue")
+
+ethe1_89$fill_color <- ifelse(ethe1_89$treatment == "AP39.full",
+                                  ethe1_89$habitat,
+                                  NA)
+
+ethe1_89_plot<-ggplot(ethe1_89, aes(x = pop.treatment, y = count, color = habitat)) +
+  geom_boxplot() +
+  scale_color_manual(values = color_palette) +
+  facet_wrap(~tissue) +
+  theme_minimal()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ggtitle("ethe1 1 normalized counts")
+ethe1_89_plot
+
+sqr_pathway_counts %>%
+         filter(gene.name == 'LOC106917690') -> ethe1_90
+
+ethe1_90$pop.treatment <- paste(ethe1_90$pop, ethe1_90$treatment, sep = ".")
+color_palette <- c("s" = "gold", "ns" = "skyblue")
+
+ethe1_90$fill_color <- ifelse(ethe1_90$treatment == "AP39.full",
+                                  ethe1_90$habitat,
+                                  NA)
+
+ethe1_90_plot<-ggplot(ethe1_90, aes(x = pop.treatment, y = count, color = habitat)) +
+  geom_boxplot() +
+  scale_color_manual(values = color_palette) +
+  facet_wrap(~tissue) +
+  theme_minimal()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ggtitle("ethe1 2 normalized counts")
+ethe1_90_plot
+
+sqr_pathway_counts$pop.treatment <- paste(sqr_pathway_counts$pop, sqr_pathway_counts$treatment, sep = ".")
+
+sqr_pathway_counts$pop.treatment <- factor(sqr_pathway_counts$pop.treatment, levels = c('bonita.control', 'bonita.PBS', 'bonita.AP39.full', "pso.control", "pso.PBS", "pso.AP39.full", "puya.control", 'puya.PBS', "puya.AP39.full", 'lluvia.control', 'lluvia.PBS', 'lluvia.AP39.full'))
+
+sqr_pathway_counts_plot <-ggplot(sqr_pathway_counts, aes(x = pop.treatment, y = count, color = habitat)) +
+  geom_boxplot() +
+  scale_color_manual(values = color_palette) +
+  facet_wrap(~gene.name + tissue, ncol = 2) +
+  theme_minimal()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ggtitle("SQR pathway genes normalized gene expression")
+sqr_pathway_counts_plot
+pdf("/Users/kararyan/Documents/AP39_Tagseq/sqr_pathway_genes.pdf")
+sqr_pathway_counts_plot
+sqr_pathway_counts %>%
+  filter(pop.treatment == "bonita.AP39.full" & tissue == 'liver' & gene.name == "LOC106917690")
+sqr_pathway_counts_plot_free_y <-ggplot(sqr_pathway_counts, aes(x = pop.treatment, y = count, color = habitat)) +
+  geom_boxplot() +
+  scale_color_manual(values = color_palette) +
+  facet_wrap(~gene.name + tissue, ncol = 2, scales = 'free_y') +
+  theme_minimal()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ggtitle("SQR pathway genes normalized gene expression")
+sqr_pathway_counts_plot_free_y
+pdf("/Users/kararyan/Documents/AP39_Tagseq/sqr_pathway_genes_free_y.pdf")
+sqr_pathway_counts_plot_free_y
+
+library(ggpubr)
+ggarrange(sqr_plot + rremove("xlab"),  ethe1_89_plot + rremove("xlab"), ethe1_90_plot, ncol = 1, common.legend = FALSE )
+
+
+ecotype_boxplot <-ggplot(sqr_pathway_counts, aes(x = treatment, y = count, color = habitat)) +
+  geom_boxplot() +
+  scale_color_manual(values = color_palette) +
+  facet_wrap(~gene.name + tissue, ncol = 2, scales = 'free_y') +
+  theme_minimal()+ theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ggtitle("SQR pathway genes normalized gene expression")
+ecotype_boxplot
+```
+
+
+```{r}
+# Force fill_color to character (important!)
+sqrdl$fill_color <- ifelse(sqrdl$treatment == "AP39.full",
+                           as.character(sqrdl$habitat),
+                           NA_character_)
+
+# Define color palette for "s" and "ns"
+color_palette <- c("s" = "gold", "ns" = "skyblue")
+
+# Plot
+ggplot(sqrdl, aes(x = pop.treatment, y = count, color = habitat, fill = fill_color)) +
+  geom_boxplot() +
+  scale_color_manual(values = color_palette) +
+  scale_fill_manual(values = c(color_palette)) +  # you can remove "none" if not using it
+  facet_wrap(~tissue) +
+  theme_minimal()
+```
+
+
+
+## heatmap tissues 
+```{r}
+
+dds_all <- estimateSizeFactors(dds_all)
+# Variance Stabilizing Transformation
+vsd <- vst(dds_all, blind = TRUE)
+
+# Extract the transformed expression matrix
+vsd_mat <- assay(vsd)
+
+# Calculate the row variance for each gene
+gene_variances <- apply(vsd_mat, 1, var)
+
+# Select top 2500 most variable genes
+top_genes <- head(order(gene_variances, decreasing = TRUE), 2000)
+top_vsd_mat <- vsd_mat[top_genes, ]
+
+# Optional: Add annotation for columns (samples)
+# Here we use the colData from the DESeq object
+sample_anno <- as.data.frame(colData(dds))
+
+library(pheatmap)
+# Generate the heatmap with hierarchical clustering
+
+sample_anno
+sample_anno %>%
+  select(tissue) -> sample_anno_2
+
+pdf("heatmap_top2000.pdf", width = 10, height = 12)
+pheatmap(top_vsd_mat,
+         scale = "row",                 # Standardize each gene (z-score)
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         annotation_col = sample_anno_2, # Sample metadata
+         show_rownames = FALSE,        # Hide gene names for clarity
+         fontsize_col = 10,            # Sample name font size
+         main = "Top 2000 Variable Genes Heatmap")
+
+# Save as PDF if desired
+
+# pheatmap(...)  # Repeat the call inside
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Gill Analysis
+
+### Set up gill matrix
+
+```{r gill set up deseq object}
+
+# filter metadata to gill tissue only and remove sample swap
+anno %>%
+  filter(tissue =='gill' & tube.id != 'EFR22.080' & treatment != "AP39.half" & tube.id != "EFR22.142") %>%
+  select(tube.id, pop, treatment, group, mass, drainage, habitat)-> gill_meta
+gill_meta
+
+# create a list of tube.ids to keep 
+keep <- gill_meta$tube.id
+
+#filter counts matrix to keep samples in gill list
+rownames(counts) <- counts$Geneid
+counts
+
+counts %>%
+  select(all_of(keep)) -> gill_counts
+gill_counts <- gill_counts[rowSums(gill_counts > 3) > 3, ]
+
+# get sample size of unfiltered gill data
+ncol(gill_counts)
+
+nrow(gill_counts)
+# convert gill counts to a matrix
+gill_counts_matrix <- as.matrix(gill_counts)
+
+# remove tube id column and convert it to the rownames 
+gill_anno_matrix <- as.matrix(gill_meta[,-1])
+rownames(gill_anno_matrix) <- gill_meta[,1]
+
+# confirm the same number of samples in both the counts and annotation
+all(rownames(gill_anno_matrix %in% colnames(gill_counts_matrix)))
+# confirm the sample names are in the matrix 
+all(rownames(gill_anno_matrix) == colnames(gill_counts_matrix))
+
+ncol(gill_counts_matrix) 
+nrow(gill_anno_matrix)
+
+gill_meta$pop <- as.factor(gill_meta$pop)
+summary(gill_meta$group)
+```
+
+### Set up DESeq design
+
+```{r deseq gill}
+summary(anno$mass)
+
+# set up deseq2 dataset 
+dds_gill <- DESeqDataSetFromMatrix(countData = gill_counts_matrix, colData = gill_anno_matrix, design = ~ treatment + pop + mass )
+# Run DESeq2 
+dds_gill <- DESeq(dds_gill)
+
+vsd_gill <- vst(dds_gill, blind=T)
+
+pcaData_gill<- plotPCA(vsd_gill, intgroup=c("treatment", 'pop'), returnData=TRUE, ntop = 10000) 
+percentVar <- round(100 * attr(pcaData_gill, "percentVar")) 
+pcaData_gill$fill_color <- ifelse(pcaData_gill$treatment == "AP39.full",
+                                  pcaData_gill$habitat,
+                                  NA)
+# Step 2: Define color and fill palettes
+color_palette <- c("s" = "gold", "ns" = "skyblue")  # change to actual habitat names
+shape_palette <- c("taco" = 22, "puya" = 24)
+# Use shape values 21 and 24 (can be filled)
+
+gill_PCA <- ggplot(pcaData_gill, aes(x = PC1, y = PC2,
+                                     color = habitat,
+                                     shape = drainage,
+                                     fill = fill_color)) +
+  geom_point(size = 3, stroke = 1) +
+ # geom_text(aes(label = name)) +
+  scale_shape_manual(values = shape_palette) +
+  scale_color_manual(values = color_palette) +
+  scale_fill_manual(values = color_palette, na.value = NA) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme_minimal() +
+  ggtitle("Gill PCA, n = 200") 
+
+gill_PCA 
+```
+
+```{r}
+
+dds_gill <- estimateSizeFactors(dds_gill)
+# Variance Stabilizing Transformation
+vsd_gill <- vst(dds_gill, blind = TRUE)
+
+# Extract the transformed expression matrix
+vsd_mat_gill <- assay(vsd_gill)
+
+# Calculate the row variance for each gene
+gene_variances_gill <- apply(vsd_mat_gill, 1, var)
+
+# Select top 2500 most variable genes
+top_genes_gill <- head(order(gene_variances_gill, decreasing = TRUE), 100)
+top_vsd_mat_gill <- vsd_mat_gill[top_genes_gill, ]
+
+# Optional: Add annotation for columns (samples)
+# Here we use the colData from the DESeq object
+sample_anno_gill <- as.data.frame(colData(dds_gill))
+
+sample_anno_gill
+# Generate the heatmap with hierarchical clustering
+
+sample_anno_gill %>%
+  select(treatment, habitat, drainage) -> sample_anno_2_gill
+
+#pdf("heatmap_top2000.pdf", width = 10, height = 12)
+pheatmap(top_vsd_mat_gill,
+         scale = "row",                 # Standardize each gene (z-score)
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         annotation_col = sample_anno_2_gill, # Sample metadata
+         show_rownames = FALSE,        # Hide gene names for clarity
+         fontsize_col = 10,            # Sample name font size
+         main = "Top 2000 Variable Genes Heatmap")
+
+# Save as PDF if desired
+
+# pheatmap(...)  # Repeat the call inside
+#dev.off()
+```
+
+
+
+
+
+
+
+
+```{r}
+# Extract Cook's distance
+cooks <- assays(dds_gill)[["cooks"]]
+
+cooks <- as.data.frame(cooks)
+cooks$gene <- row.names(cooks)
+summary(cooks)
+# Convert to tidy format for summarization
+cooks_tidy <- cooks %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "cooks_distance")
+```
+
+
+```{r}
+cooks_tidy
+# Merge group information
+cooks_tidy <- cooks_tidy %>%
+  left_join(anno, by = c("sample" = "tube.id"))
+cooks_tidy
+
+# Summarize Cook's distance per sample
+sample_cooks_summary <- cooks_tidy %>%
+  group_by(sample, pop) %>%
+  summarize(mean_cooks = mean(cooks_distance, na.rm = TRUE),
+            pct95_cooks = quantile(cooks_distance, 0.99, na.rm = TRUE),
+            .groups = "drop")
+sample_cooks_summary %>%
+  arrange(mean_cooks)
+sample_cooks_summary
+# Optionally: flag samples above a threshold
+threshold <- 1  # can be adjusted
+
+flagged <- sample_cooks_summary %>%
+  filter(pct95_cooks > threshold) %>%
+  arrange(desc(pct95_cooks))
+
+# Output the flagged samples
+print(flagged)
+
+# Optional visualization
+ggplot(sample_cooks_summary, aes(x = sample, y = pct95_cooks, fill = pop)) +
+  geom_col() +
+  geom_hline(yintercept = threshold, linetype = "dashed", color = "red") +
+  labs(title = "95th Percentile of Cook's Distance by Sample",
+       y = "95th Percentile Cook's Distance") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+```{r deseq gill}
+pcaData_gill %>%
+  arrange(PC1)
+pcaData_gill
+anno
+
+gill_PCA_for_sup <- ggplot(pcaData_gill, aes(x = PC1, y = PC2, color = habitat, shape =population)) + 
+  geom_point(size =3, aes(fill=treatment)) + 
+  geom_point(size =3) +
+  scale_shape_manual(values = c(15,2, 0,17,)) +
+  scale_color_manual(values=c('gold','skyblue')) +
+  scale_fill_manual(values=gill_meta) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) + 
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) + 
+  theme_minimal() +
+  ggtitle("Gill PCA, n = 150") 
+
+#pdf("/Users/kararyan/Desktop/Tagseq_exposure_may25/Gill_PCA.pdf")
+gill_PCA
+#pdf("/Users/kararyan/Desktop/Tagseq_exposure_may25/FigS2.pdf")
+gill_PCA_for_sup
+
+```
+
+### set up for new contrasts
+
+```{r deseq gill}
+resultsNames(dds_gill)
+
+mod_mat <- model.matrix(design(dds_gill), colData(dds_gill))
+
+# calculate the vector of coefficient weights
+# taco S
+taco_s_full <- colMeans(mod_mat[dds_gill$group == 'taco.s.AP39.full',])
+taco_s_con <- colMeans(mod_mat[dds_gill$group == 'taco.s.control',])
+taco_s_pbs <- colMeans(mod_mat[dds_gill$group == 'taco.s.PBS',])
+
+#taco NS
+taco_ns_full <- colMeans(mod_mat[dds_gill$group == 'taco.ns.AP39.full',])
+taco_ns_con <- colMeans(mod_mat[dds_gill$group == 'taco.ns.control',])
+taco_ns_pbs <- colMeans(mod_mat[dds_gill$group == 'taco.ns.PBS',])
+
+# puya S
+puya_s_full <- colMeans(mod_mat[dds_gill$group == 'puya.s.AP39.full',])
+puya_s_con <- colMeans(mod_mat[dds_gill$group == 'puya.s.control',])
+puya_s_pbs <- colMeans(mod_mat[dds_gill$group == 'puya.s.PBS',])
+
+# Puya NS
+puya_ns_full <- colMeans(mod_mat[dds_gill$group == 'puya.ns.AP39.full',])
+puya_ns_con <- colMeans(mod_mat[dds_gill$group == 'puya.ns.control',])
+puya_ns_pbs <- colMeans(mod_mat[dds_gill$group == 'puya.ns.PBS',])
+```
+
+### Gill control vs PBS
+
+```{r gill control pbs}
+# Taco S (AvsB) 
+Taco_s_A_B_gill <- results(dds_gill, contrast = taco_s_con - taco_s_pbs) 
+sum(Taco_s_A_B_gill$padj < 0.05, na.rm=T)
+Taco_s_A_B_gill <- as.data.frame(Taco_s_A_B_gill)
+# = 9 
+
+Taco_s_A_B_gill$gene <- rownames(Taco_s_A_B_gill)
+Taco_s_A_B_gill %>%
+  arrange(padj) %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No")) %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->Taco_s_A_B_gill
+
+
+# Taco NS (AvsB)
+Taco_ns_A_B_gill <- results(dds_gill, contrast = taco_ns_con - taco_ns_pbs) 
+sum(Taco_ns_A_B_gill$padj < 0.05, na.rm=T)
+#= 19 
+Taco_ns_A_B_gill <- as.data.frame(Taco_ns_A_B_gill)
+Taco_ns_A_B_gill$gene <- rownames(Taco_ns_A_B_gill)
+Taco_ns_A_B_gill %>%
+  arrange(padj) %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No")) ->Taco_ns_A_B_gill
+Taco_ns_A_B_gill
+
+# puya S (AvsB)
+puya_s_A_B_gill <- results(dds_gill, contrast = puya_s_con - puya_s_pbs) 
+sum(puya_s_A_B_gill$padj < 0.05, na.rm=T)
+# = 5 
+puya_s_A_B_gill <- as.data.frame(puya_s_A_B_gill)
+puya_s_A_B_gill %>%
+  arrange(padj)
+
+# puya NS (AvsB)
+puya_ns_A_B_gill <- results(dds_gill, contrast = puya_ns_con - puya_ns_pbs) 
+sum(puya_ns_A_B_gill$padj < 0.05, na.rm=T)
+
+puya_ns_A_B_gill <- as.data.frame(puya_ns_A_B_gill)
+puya_ns_A_B_gill %>%
+  arrange(padj)
+
+0+5+19+9
+33/4
+```
+
+
+
+```{r}
+# Taco NS vs S 
+Taco_s_taco_ns_A <- results(dds_gill, contrast = ((taco_s_con + taco_s_pbs)/2) - ((taco_ns_con+ taco_ns_pbs)/2)) 
+sum(Taco_s_taco_ns_A$padj < 0.05, na.rm=T)
+Taco_s_taco_ns_A
+# make the results a data frame
+Taco_s_taco_ns_A  <- as.data.frame(Taco_s_taco_ns_A )
+# make a column of the gene names 
+Taco_s_taco_ns_A$gene <- rownames(Taco_s_taco_ns_A )
+# join with annotations 
+Taco_s_taco_ns_A  %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->Taco_s_taco_ns_A 
+arrange(Taco_s_taco_ns_A, padj)
+Taco_s_taco_ns_A  %>%
+  arrange(padj)  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))->Taco_s_taco_ns_A 
+Taco_s_taco_ns_A$diffexpressed <- as.factor(Taco_s_taco_ns_A$diffexpressed)
+summary(Taco_s_taco_ns_A)
+
+summary(Taco_s_taco_ns_A)
+
+write.table(Taco_s_taco_ns_A , '/Users/kararyan/Documents/AP39_Tagseq/taco_A_ns_s_gill.tsv',quote = F, row.names = F,sep = '\t' )
+
+Taco_s_ns_AP39 <- results(dds_gill, contrast = taco_s_full - taco_ns_full)
+sum(Taco_s_ns_AP39$padj < 0.05, na.rm=T)
+Taco_s_ns_AP39 <- as.data.frame(Taco_s_ns_AP39)
+Taco_s_ns_AP39$gene <- rownames(Taco_s_ns_AP39 )
+Taco_s_ns_AP39 %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->Taco_s_ns_AP39
+
+Taco_s_ns_AP39%>%
+  arrange(padj)  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))->Taco_s_ns_AP39
+Taco_s_ns_AP39$diffexpressed <- as.factor(Taco_s_ns_AP39$diffexpressed)
+summary(Taco_s_ns_AP39)
+
+```
+
+
+
+```{r}
+
+# puya ecotype gill
+puya_s_puya_ns_A<- results(dds_gill, contrast = ((puya_s_con+ puya_s_pbs)/2) - ((puya_ns_con+puya_ns_pbs)/2))
+sum(puya_s_puya_ns_A$padj < 0.05, na.rm=T)
+arrange(puya_s_puya_ns_A, padj)
+sum(puya_s_puya_ns_A) %>%
+      arrange(padj)
+# make the results a data frame
+puya_s_puya_ns_A  <- as.data.frame(puya_s_puya_ns_A )
+# make a column of the gene names 
+puya_s_puya_ns_A$gene <- rownames(puya_s_puya_ns_A )
+# join with annotations 
+puya_s_puya_ns_A  %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->puya_s_puya_ns_A 
+puya_s_puya_ns_A
+puya_s_puya_ns_A  %>%
+  arrange(padj)  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))->puya_s_puya_ns_A 
+puya_s_puya_ns_A$diffexpressed<- as.factor(puya_s_puya_ns_A$diffexpressed)
+summary(puya_s_puya_ns_A)
+puya_s_puya_ns_A  %>%
+  filter(gene.name == 'LOC106917689')
+puya_s_puya_ns_A
+write.table(puya_s_puya_ns_A , '/Users/kararyan/Documents/AP39_Tagseq/puya_A_ns_s_gill.tsv',quote = F, row.names = F,sep = '\t' )
+
+puya_s_puya_ns_A %>%
+  filter(padj < 0.05) %>%
+  inner_join(
+    Taco_s_taco_ns_A %>% filter(padj < 0.05),
+    by = join_by(gene, gene.name, Uniprot, Hugo_human, Protein.annotations)
+  )
+puya_s_puya_ns_A %>%
+  filter(gene.name == "sqrdl" | gene.name == 'LOC106917689' | gene.name == 'LOC106917690')
+
+puya_s_puya_ns_A %>%
+  filter(padj < 0.05) -> puya_s_ns_sig_gill
+
+Taco_s_taco_ns_A  %>%
+  filter(padj < 0.05) -> taco_s_ns_sig_gill
+taco_s_ns_sig_gill
+puya_s_ns_sig_gill
+
+puya_s_ns_sig_gill %>%
+  inner_join(taco_s_ns_sig_gill, by = 'gene') %>%
+  select(log2FoldChange.x, log2FoldChange.y, gene, gene.name.x, Hugo_human.x, Protein.annotations.x) -> gill_control_shared
+
+capture_genes<- read.csv('/Users/kararyan/Downloads/mec17081-sup-0001-appendixs1/mec17081-sup-0002-TableS2.csv')
+capture_genes
+gill_control_shared
+capture_genes %>%
+  full_join(gill_control_shared, by = c('Gene.name.from.accession' = 'gene.name.x'))
+```
+
+```{r}
+padj_cutoff <- 0.05
+lfc_cutoff <- 0
+up_taco_s_ns <- taco_s_ns_sig_gill  %>% filter(padj < padj_cutoff, log2FoldChange > lfc_cutoff) %>% pull(gene)
+  
+down_taco_s_ns <- taco_s_ns_sig_gill  %>% filter(padj < padj_cutoff, log2FoldChange < lfc_cutoff) %>% pull(gene)
+
+up_puya_s_ns <- puya_s_puya_ns_A  %>% filter(padj < padj_cutoff, log2FoldChange > lfc_cutoff) %>% pull(gene)
+  
+down_puya_s_ns <- puya_s_puya_ns_A  %>% filter(padj < padj_cutoff, log2FoldChange < lfc_cutoff) %>% pull(gene)
+
+# Create gene lists
+up_list_eco <- list(
+  Tacotalpa = up_taco_s_ns,
+  Puyacatengo = up_puya_s_ns
+)
+
+down_list_eco <- list(
+  Tacotalpa = down_taco_s_ns,
+  Puyacatengo = down_puya_s_ns
+)
+
+venn_up_eco <- venn.diagram(
+  x = up_list_eco,
+  category.names = names(up_list_eco),
+  filename = NULL,
+ # fill = c("red", "orange", "tomato"),
+  alpha = 0.5,
+  cex = 1.2,
+  fontface = "bold",
+  cat.cex = 1.2,
+  cat.fontface = "bold",
+  main = "Upregulated Genes"
+)
+grid.newpage()
+pdf(file="/Users/kararyan/Documents/AP39_Tagseq/gill_venn_up_eco.pdf")
+grid.draw(venn_up_eco)
+dev.off()
+
+venn_down_eco <- venn.diagram(
+  x = down_list_eco,
+  category.names = names(down_list_eco),
+  filename = NULL,
+ # fill = c("red", "orange", "tomato"),
+  alpha = 0.5,
+  cex = 1.2,
+  fontface = "bold",
+  cat.cex = 1.2,
+  cat.fontface = "bold",
+  main = "Upregulated Genes"
+)
+grid.newpage()
+pdf(file="/Users/kararyan/Documents/AP39_Tagseq/gill_venn_down_eco.pdf")
+grid.draw(venn_down_eco)
+dev.off()
+
+library(gplots)
+ItemsList <- venn(up_list_eco, show.plot = FALSE)
+
+lengths(attributes(ItemsList)$intersections)
+list_s_up<- attributes(ItemsList)$intersections$`Tacotalpa:Puyacatengo`
+genes<- as.data.frame(list_s_up)
+genes
+taco_s_ns_sig_gill %>%
+  inner_join(genes, by = c("gene" = "list_s_up")) ->eco_gill_2
+
+ItemsList <- venn(down_list_eco, show.plot = FALSE)
+lengths(attributes(ItemsList)$intersections)
+list_s_down<- attributes(ItemsList)$intersections$`Tacotalpa:Puyacatengo`
+genes<- as.data.frame(list_s_down)
+genes
+taco_s_ns_sig_gill %>%
+  inner_join(genes, by = c("gene" = "list_s_down")) -> eco_gill_1
+
+eco_gill_1 %>%
+  merge(eco_gill_2)
+rbind(eco_gill_2, eco_gill_1) -> eco_gill_genes_forground
+
+eco_gill_genes_forground<- na.omit(eco_gill_genes_forground)
+eco_gill_genes_forground
+
+genes <- eco_gill_genes_forground$Unprot
+genes
+genes %>%
+  dplyr::select(Uniprot)
+# Name the vector
+genes <- eco_gill_genes_forground$Uniprot
+genes
+# omit NA values
+genes <- na.omit(genes)
+genes
+na.omit(puya_s_puya_ns_A)
+na.omit(puya_s_puya_ns_A) ->puya_s_puya_ns_A.rm
+
+library(org.Hs.eg.db, character.only = TRUE)
+
+names(taco_s_ns_sig_gill)
+go_enrich <- enrichGO(gene = genes,
+                      universe = puya_s_puya_ns_A.rm$Uniprot,
+                      OrgDb = org.Hs.eg.db::org.Hs.eg.db, 
+                      keyType = 'UNIPROT',
+                      readable = T,
+                      ont = "ALL",
+                      minGSSize = 2, 
+                      pvalueCutoff = 0.05)
+go_enrich 
+dotplot(go_enrich)
+
+?enrichGO
+```
+
+
+
+
+
+### Gill ecotype comparison (ap39 vs ap39)
+
+```{r}
+# Taco NS vs S 
+Taco_s_taco_ns_D <- results(dds_gill, contrast = taco_s_full - taco_ns_full) 
+sum(Taco_s_taco_ns_D$padj < 0.05, na.rm=T)
+
+Taco_s_taco_ns_D
+# make the results a data frame
+Taco_s_taco_ns_D  <- as.data.frame(Taco_s_taco_ns_D )
+# make a column of the gene names 
+Taco_s_taco_ns_D$gene <- rownames(Taco_s_taco_ns_D )
+# join with annotations 
+Taco_s_taco_ns_D  %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->Taco_s_taco_ns_D 
+arrange(Taco_s_taco_ns_D, padj)
+Taco_s_taco_ns_D  %>%
+  arrange(padj)   %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))
+
+
+Taco_s_taco_ns_D %>%
+  filter(padj < 0.05) %>%
+  inner_join(
+    Taco_s_taco_ns_A %>% filter(padj < 0.05),
+    by = join_by(gene, gene.name, Uniprot, Hugo_human, Protein.annotations)
+  )
+Taco_s_taco_ns_D 
+write.table(Taco_s_taco_ns_D , '/Users/kararyan/Documents/AP39_Tagseq/taco_D_ns_s_gill.tsv',quote = F, row.names = F,sep = '\t' )
+```
+
+### Gill compare AP39 to control + PBS
+
+```{r gill results}
+# Taco S (A+B/2) vs D 
+Taco_s_AB_D_gill <- results(dds_gill, contrast = taco_s_full - (taco_s_con + taco_s_pbs)/2) 
+sum(Taco_s_AB_D_gill$padj < 0.05, na.rm=T)
+Taco_s_AB_D_gill<- as.data.frame(Taco_s_AB_D_gill )
+Taco_s_AB_D_gill$gene <- rownames(Taco_s_AB_D_gill)
+
+Taco_s_AB_D_gill %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) %>%
+  arrange(padj) %>%
+  filter(padj < 0.05) -> Taco_s_AB_D_gill_sig
+
+
+Taco_s_AB_D_gill
+# Taco NS (A+B/2) vs D 
+Taco_ns_AB_D_gill <- results(dds_gill, contrast =taco_ns_full - (taco_ns_con + taco_ns_pbs)/2) 
+sum(Taco_ns_AB_D_gill$padj < 0.05, na.rm=T)
+Taco_ns_AB_D_gill<- as.data.frame(Taco_ns_AB_D_gill)
+Taco_ns_AB_D_gill$gene <- rownames(Taco_ns_AB_D_gill)
+ Taco_ns_AB_D_gill%>%
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) %>%
+  arrange(padj)  %>%
+  filter(padj < 0.05) ->  Taco_ns_AB_D_gill_sig
+
+# puya S (A+B/2) vs D
+puya_s_AB_D_gill <- results(dds_gill, contrast = puya_s_full - (puya_s_con + puya_s_pbs)/2) 
+sum(puya_s_AB_D_gill$padj < 0.05, na.rm=T)
+puya_s_AB_D_gill<- as.data.frame(puya_s_AB_D_gill)
+puya_s_AB_D_gill$gene <- rownames(puya_s_AB_D_gill)
+puya_s_AB_D_gill %>%
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) %>%
+  arrange(padj) %>%
+  filter(padj < 0.05) -> puya_s_AB_D_gill_sig
+
+# puya NS(A+B/2) vs D
+puya_ns_AB_D_gill <- results(dds_gill, contrast =puya_ns_full - (puya_ns_con + puya_ns_pbs)/2) 
+sum(puya_ns_AB_D_gill$padj < 0.05, na.rm=T)
+
+puya_ns_AB_D_gill<- as.data.frame(puya_ns_AB_D_gill)
+puya_ns_AB_D_gill$gene <- rownames(puya_ns_AB_D_gill)
+ puya_ns_AB_D_gill %>%
+   left_join(Pmex_human,join_by('gene' =='gene.ID')) %>%
+  arrange(padj) %>%
+  filter(padj < 0.05) -> puya_ns_AB_D_gill_sig
+ 
+ 
+ puya_ns_AB_D_gill_sig
+ puya_s_AB_D_gill_sig
+ 
+ 
+puya_ns_AB_D_gill_sig %>%
+inner_join(puya_s_AB_D_gill_sig, by = 'gene') %>%
+  select(log2FoldChange.x, log2FoldChange.y, gene, gene.name.x, Hugo_human.x) -> shared_puya
+shared_puya
+
+Taco_ns_AB_D_gill_sig
+Taco_s_AB_D_gill_sig
+
+Taco_ns_AB_D_gill_sig%>%
+  inner_join(Taco_s_AB_D_gill_sig, by = 'gene') %>%
+  select(log2FoldChange.x, log2FoldChange.y, gene, gene.name.x, Hugo_human.x) -> shared_taco
+
+shared_taco %>%
+  inner_join(shared_puya, by = 'gene')
+shared_puya
+shared_taco
+
+ puya_s_AB_D_gill_sig %>%
+   inner_join(Taco_s_AB_D_gill_sig, by = 'gene')
+ 
+ 
+  puya_ns_AB_D_gill_sig %>%
+   inner_join(Taco_ns_AB_D_gill_sig, by = 'gene')
+```
+
+## make Venn of overlap
+```{r gill results}
+padj_cutoff <- 0.05
+lfc_cutoff <- 0
+up_puya_s <- puya_s_AB_D_gill_sig  %>% filter(padj < padj_cutoff, log2FoldChange > lfc_cutoff) %>% pull(gene)
+  
+down_puya_s <- puya_s_AB_D_gill_sig  %>% filter(padj < padj_cutoff, log2FoldChange < lfc_cutoff) %>% pull(gene)
+
+up_puya_ns <- puya_ns_AB_D_gill_sig  %>% filter(padj < padj_cutoff, log2FoldChange > lfc_cutoff) %>% pull(gene)
+  
+down_puya_ns <- puya_ns_AB_D_gill_sig  %>% filter(padj < padj_cutoff, log2FoldChange < lfc_cutoff) %>% pull(gene)
+
+up_taco_s <- Taco_s_AB_D_gill_sig  %>% filter(padj < padj_cutoff, log2FoldChange > lfc_cutoff) %>% pull(gene)
+  
+down_taco_s <- Taco_s_AB_D_gill_sig  %>% filter(padj < padj_cutoff, log2FoldChange < lfc_cutoff) %>% pull(gene)
+
+up_taco_ns <- Taco_ns_AB_D_gill_sig  %>% filter(padj < padj_cutoff, log2FoldChange > lfc_cutoff) %>% pull(gene)
+  
+down_taco_ns <- Taco_ns_AB_D_gill_sig  %>% filter(padj < padj_cutoff, log2FoldChange < lfc_cutoff) %>% pull(gene)
+
+# Create gene lists
+up_list <- list(
+  PuyaS = up_puya_s,
+  TacoS = up_taco_s,
+  PuyaNS = up_puya_ns,
+  TacoNS = up_taco_ns
+)
+
+down_list <- list(
+  PuyaS = down_puya_s,
+  TacoS = down_taco_s,
+  PuyaNS = down_puya_ns,
+  TacoNS = down_taco_ns
+)
+
+down_list
+# Generate Venn diagram for upregulated genes
+venn_up <- venn.diagram(
+  x = up_list,
+  category.names = names(up_list),
+  filename = NULL,
+ # fill = c("red", "orange", "tomato"),
+  alpha = 0.5,
+  cex = 1.2,
+  fontface = "bold",
+  cat.cex = 1.2,
+  cat.fontface = "bold",
+  main = "Upregulated Genes"
+)
+grid.newpage()
+pdf(file="/Users/kararyan/Documents/AP39_Tagseq/gill_venn_up.pdf")
+grid.draw(venn_up)
+dev.off()
+
+
+
+library(gplots)
+ItemsList <- venn(up_list, show.plot = FALSE)
+
+lengths(attributes(ItemsList)$intersections)
+attributes(ItemsList)$intersections
+puya_s_AB_D_gill_sig %>%
+  filter(gene == "gene22741")
+
+gene8866
+```
+
+
+```{r gill results}
+# Generate Venn diagram for downregulated genes
+venn_down <- venn.diagram(
+  x = down_list,
+  category.names = names(down_list),
+  filename = NULL,
+ # fill = c("dodgerblue", "skyblue", "steelblue"),
+  alpha = 0.5,
+  cex = 1.2,
+  fontface = "bold",
+  cat.cex = 1.2,
+  cat.fontface = "bold",
+  main = "Downregulated Genes"
+)
+grid.newpage()
+grid.newpage()
+pdf(file="/Users/kararyan/Documents/AP39_Tagseq/gill_venn_down.pdf")
+grid.draw(venn_down)
+dev.off()
+
+```
+
+### 
+
+### Annotate gill results and write tables
+
+#### Taco
+
+```{r annotate gill results}
+# make the results a data frame
+Taco_s_AB_D_gill <- as.data.frame(Taco_s_AB_D_gill)
+# make a column of the gene names 
+Taco_s_AB_D_gill$gene <- rownames(Taco_s_AB_D_gill)
+# join with annotations 
+Taco_s_AB_D_gill %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->Taco_s_AB_D_gill
+Taco_s_AB_D_gill %>%
+  arrange(padj)  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))->Taco_s_AB_D_gill
+
+Taco_s_AB_D_gill
+write.table(Taco_s_AB_D_gill, '/Users/kararyan/Documents/AP39_Tagseq/Taco_s_AB_D_gill_downsampled.tsv',quote = F, row.names = F,sep = '\t' )
+
+# make the results a data frame
+Taco_ns_AB_D_gill <- as.data.frame(Taco_ns_AB_D_gill)
+# make a column of the gene names 
+Taco_ns_AB_D_gill$gene <- rownames(Taco_ns_AB_D_gill)
+# join with annotations 
+Taco_ns_AB_D_gill %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->Taco_ns_AB_D_gill
+Taco_ns_AB_D_gill %>%
+  arrange(padj) -> Taco_ns_AB_D_gill
+
+head(Taco_ns_AB_D_gill)
+Taco_ns_AB_D_gill %>%
+  arrange(padj)  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))->Taco_ns_AB_D_gill
+Taco_ns_AB_D_gill
+write.table(Taco_ns_AB_D_gill, '/Users/kararyan/Documents/AP39_Tagseq/Taco_ns_AB_D_gill_downsampled.tsv',quote = F, row.names = F,sep = '\t' )
+```
+
+#### Puya
+
+```{r annotate gill results puya}
+# make the results a data frame
+puya_s_AB_D_gill <- as.data.frame(puya_s_AB_D_gill)
+# make a column of the gene names 
+puya_s_AB_D_gill$gene <- rownames(puya_s_AB_D_gill)
+# join with annotations 
+puya_s_AB_D_gill %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->puya_s_AB_D_gill
+puya_s_AB_D_gill %>%
+  arrange(padj)  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))->puya_s_AB_D_gill
+puya_s_AB_D_gill
+write.table(puya_s_AB_D_gill, '/Users/kararyan/Documents/AP39_Tagseq/puya_s_AB_D_gill_downsampled.tsv',quote = F, row.names = F,sep = '\t' )
+
+# make the results a data frame
+puya_ns_AB_D_gill <- as.data.frame(puya_ns_AB_D_gill)
+# make a column of the gene names 
+puya_ns_AB_D_gill$gene <- rownames(puya_ns_AB_D_gill)
+# join with annotations 
+puya_ns_AB_D_gill %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->puya_ns_AB_D_gill
+puya_ns_AB_D_gill %>%
+  arrange(padj) %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No")) ->puya_ns_AB_D_gill
+write.table(puya_ns_AB_D_gill, '/Users/kararyan/Documents/AP39_Tagseq/puya_ns_AB_D_gill_downsampled.tsv',quote = F, row.names = F,sep = '\t' )
+```
+
+## Liver comparisons
+
+```{r gill set up deseq object liver}
+# filter metadata to liver tissue only and remove sample swap
+anno %>%
+  filter(tissue =='liver' & tube.id != 'EFR22.081' & treatment != "AP39.half" & tube.id != 'EFR22.193') %>%
+  select(tube.id, pop, treatment, group, mass, habitat, drainage)-> liver_meta
+
+# create a list of tube.ids to keep 
+keep <- liver_meta$tube.id
+
+#filter counts matrix to keep samples in liver list
+rownames(counts) <- counts$Geneid
+counts %>%
+  select(all_of(keep)) -> liver_counts
+liver_counts <- liver_counts[rowSums(liver_counts > 5) > 7, ]
+
+# get sample size of unfiltered liver data
+ncol(liver_counts)
+
+# convert liver counts to a matrix
+liver_counts_matrix <- as.matrix(liver_counts)
+
+# remove tube id column and convert it to the rownames 
+liver_anno_matrix <- as.matrix(liver_meta[,-1])
+rownames(liver_anno_matrix) <- liver_meta[,1]
+liver_meta
+
+# confirm the same number of samples in both the counts and annotation
+all(rownames(liver_anno_matrix %in% colnames(liver_counts_matrix)))
+# confirm the sample names are in the matrix 
+all(rownames(liver_anno_matrix) == colnames(liver_counts_matrix))
+
+liver_meta$pop <- as.factor(liver_meta$pop)
+liver_meta$treatment <- as.factor(liver_meta$treatment)
+liver_meta %>%
+  group_by(pop) %>%
+  group_split() %>%
+  lapply(summary)
+```
+
+### Set up deseq dataset
+
+```{r deseq liver}
+# set up deseq2 dataset 
+dds_liver <- DESeqDataSetFromMatrix(countData = liver_counts_matrix, colData = liver_anno_matrix, 
+                              design = ~ mass + pop + treatment)
+# Run DESeq2 
+dds_liver <- DESeq(dds_liver)
+colData(dds_liver)
+
+vsd_liver <- vst(dds_liver, blind=T)
+
+vst_cor <- cor(assay(vsd_liver))
+average_cor <- as.data.frame(colMeans(vst_cor))
+
+pcaData_liver<- plotPCA(vsd_liver, intgroup=c("treatment", 'pop'), returnData=TRUE, ntop = 10000) 
+percentVar <- round(100 * attr(pcaData_liver, "percentVar")) 
+pcaData_liver$fill_color <- ifelse(pcaData_liver$treatment == "AP39.full",
+                                  pcaData_liver$habitat,
+                                  NA)
+
+# Step 2: Define color and fill palettes
+color_palette <- c("s" = "gold", "ns" = "skyblue")  # change to actual habitat names
+shape_palette <- c("taco" = 22, "puya" = 24)
+pcaData_liver
+# Use shape values 21 and 24 (can be filled)
+liver_PCA <- ggplot(pcaData_liver, aes(x = PC1, y = PC2,
+                                     color = habitat,
+                                     shape = drainage,
+                                     fill = fill_color)) +
+  geom_point(size = 3, stroke = 1) +
+#  geom_text(aes(label = name)) +
+  scale_shape_manual(values = shape_palette) +
+  scale_color_manual(values = color_palette) +
+  scale_fill_manual(values = color_palette, na.value = NA) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme_minimal() +
+  ggtitle("Liver")
+liver_PCA 
+
+pcaData_liver %>%
+  arrange(PC1)
+liver_PCA
+
+pcaData_liver
+
+```
+## heatmap 
+```{r}
+
+dds_liver <- estimateSizeFactors(dds_liver)
+# Variance Stabilizing Transformation
+vsd_liver <- vst(dds_liver, blind = TRUE)
+
+# Extract the transformed expression matrix
+vsd_mat_liver <- assay(vsd_liver)
+
+# Calculate the row variance for each gene
+gene_variances_liver <- apply(vsd_mat_liver, 1, var)
+
+# Select top 2500 most variable genes
+top_genes_liver <- head(order(gene_variances_liver, decreasing = TRUE), 2000)
+top_vsd_mat_liver <- vsd_mat_liver[top_genes_liver, ]
+
+# Optional: Add annotation for columns (samples)
+# Here we use the colData from the DESeq object
+sample_anno_liver <- as.data.frame(colData(dds_liver))
+
+# Generate the heatmap with hierarchical clustering
+sample_anno_liver %>%
+  select(treatment, habitat, drainage) -> sample_anno_2_liver
+
+#pdf("heatmap_top2000.pdf", width = 10, height = 12)
+pheatmap(top_vsd_mat_liver,
+         scale = "row",                 # Standardize each gene (z-score)
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         clustering_method = "complete",
+         annotation_col = sample_anno_2_liver, # Sample metadata
+         show_rownames = FALSE,        # Hide gene names for clarity
+         fontsize_col = 10,            # Sample name font size
+         main = "Top 2000 Variable Genes Heatmap")
+
+# Save as PDF if desired
+
+# pheatmap(...)  # Repeat the call inside
+#dev.off()
+```
+
+
+
+
+
+
+### Design new contrasts
+
+```{r deseq liver}
+resultsNames(dds_liver)
+
+mod_mat <- model.matrix(design(dds_liver), colData(dds_liver))
+
+# calculate the vector of coefficient weights
+taco_s_full <- colMeans(mod_mat[dds_liver$group == 'taco.s.AP39.full',])
+taco_s_con <- colMeans(mod_mat[dds_liver$group == 'taco.s.control',])
+taco_s_pbs <- colMeans(mod_mat[dds_liver$group == 'taco.s.PBS',])
+
+taco_ns_full <- colMeans(mod_mat[dds_liver$group == 'taco.ns.AP39.full',])
+taco_ns_con <- colMeans(mod_mat[dds_liver$group == 'taco.ns.control',])
+taco_ns_pbs <- colMeans(mod_mat[dds_liver$group == 'taco.ns.PBS',])
+
+puya_s_full <- colMeans(mod_mat[dds_liver$group == 'puya.s.AP39.full',])
+puya_s_con <- colMeans(mod_mat[dds_liver$group == 'puya.s.control',])
+puya_s_pbs <- colMeans(mod_mat[dds_liver$group == 'puya.s.PBS',])
+
+puya_ns_full <- colMeans(mod_mat[dds_liver$group == 'puya.ns.AP39.full',])
+puya_ns_con <- colMeans(mod_mat[dds_liver$group == 'puya.ns.control',])
+puya_ns_pbs <- colMeans(mod_mat[dds_liver$group == 'puya.ns.PBS',])
+```
+
+### obtain results of new contrasts liver
+
+```{r liver results}
+# Taco S (A+B/2) vs D 
+Taco_s_AB_D_liver <- results(dds_liver, alpha=0.1, contrast = taco_s_full - (taco_s_con + taco_s_pbs)/2) 
+sum(Taco_s_AB_D_liver$padj < 0.05, na.rm=T)
+
+# Taco NS (A+B/2) vs D 
+Taco_ns_AB_D_liver <- results(dds_liver, alpha=0.1, contrast =taco_ns_full - (taco_ns_con + taco_ns_pbs)/2) 
+sum(Taco_ns_AB_D_liver$padj < 0.05, na.rm=T)
+sum(is.na(Taco_ns_AB_D_liver$padj))
+Taco_ns_AB_D_liver
+
+# puya S (A+B/2) vs D
+puya_s_AB_D_liver <- results(dds_liver, alpha=0.1, contrast = puya_s_full - (puya_s_con + puya_s_pbs)/2) 
+sum(puya_s_AB_D_liver$padj < 0.05, na.rm=T)
+
+# puya NS(A+B/2) vs D
+puya_ns_AB_D_liver <- results(dds_liver, alpha=0.1, contrast =puya_ns_full - (puya_ns_con + puya_ns_pbs)/2)
+sum(puya_ns_AB_D_liver$padj < 0.05, na.rm=T)
+
+puya_ns_s_con_liver <- results(dds_liver, contrast =((puya_ns_con + puya_ns_pbs)/2) - ((puya_s_con + puya_s_pbs)/2))
+sum(puya_ns_s_con_liver$padj < 0.05, na.rm=T)
+
+
+```
+
+
+
+
+### annotate liver results and write tables
+
+#### Taco
+
+```{r annotate liver results}
+# make the results a data frame
+Taco_s_AB_D_liver <- as.data.frame(Taco_s_AB_D_liver)
+# make a column of the gene names 
+Taco_s_AB_D_liver$gene <- rownames(Taco_s_AB_D_liver)
+# join with annotations 
+Taco_s_AB_D_liver %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->Taco_s_AB_D_liver
+Taco_s_AB_D_liver %>%
+  arrange(desc(padj))  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))->Taco_s_AB_D_liver
+write.table(Taco_s_AB_D_liver, '/Users/kararyan/Documents/AP39_Tagseq/Taco_s_AB_D_liver_downsampled.tsv',quote = F, row.names = F,sep = '\t' )
+
+Taco_s_AB_D_liver
+Taco_s_AB_D_liver %>%
+  filter(gene.name == 'LOC106917690')
+# make the results a data frame
+Taco_ns_AB_D_liver <- as.data.frame(Taco_ns_AB_D_liver)
+# make a column of the gene names 
+Taco_ns_AB_D_liver$gene <- rownames(Taco_ns_AB_D_liver)
+# join with annotations 
+Taco_ns_AB_D_liver %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->Taco_ns_AB_D_liver
+Taco_ns_AB_D_liver %>%
+  arrange(desc(padj))  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))->Taco_ns_AB_D_liver
+
+Taco_ns_AB_D_liver %>%
+  filter(gene.name == 'sqrdl')
+write.table(Taco_ns_AB_D_liver, '/Users/kararyan/Documents/AP39_Tagseq/Taco_ns_AB_D_liver_downsampled.tsv',quote = F, row.names = F,sep = '\t' )
+
+```
+
+
+```{r}
+
+puya_ns_s_con_liver %>%
+  arrange(padj)
+
+puya_ns_s_con_liver<- as.data.frame(puya_ns_s_con_liver)
+# make a column of the gene names 
+puya_ns_s_con_liver$gene <- rownames(puya_ns_s_con_liver)
+puya_ns_s_con_liver
+# join with annotations 
+puya_ns_s_con_liver %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->puya_ns_s_con_liver 
+puya_ns_s_con_liver  %>%
+  arrange(desc(padj))  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))->puya_ns_s_con_liver 
+puya_ns_s_con_liver
+
+puya_ns_s_con_liver  %>%
+  filter(gene.name == 'LOC106917690')
+```
+
+#### Puya
+
+```{r annotate liver results puya}
+
+# make the results a data frame
+puya_s_AB_D_liver <- as.data.frame(puya_s_AB_D_liver)
+# make a column of the gene names 
+puya_s_AB_D_liver$gene <- rownames(puya_s_AB_D_liver)
+# join with annotations 
+puya_s_AB_D_liver %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->puya_s_AB_D_liver
+puya_s_AB_D_liver %>%
+  arrange(desc(padj)) %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No")) ->puya_s_AB_D_liver
+write.table(puya_s_AB_D_liver, '/Users/kararyan/Documents/AP39_Tagseq/puya_s_AB_D_liver_downsampled.tsv',quote = F, row.names = F,sep = '\t' )
+puya_s_AB_D_liver
+puya_s_AB_D_liver %>%
+  filter(gene.name == 'sqrdl')
+# make the results a data frame
+puya_ns_AB_D_liver <- as.data.frame(puya_ns_AB_D_liver)
+# make a column of the gene names 
+puya_ns_AB_D_liver$gene <- rownames(puya_ns_AB_D_liver)
+# join with annotations 
+puya_ns_AB_D_liver %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->puya_ns_AB_D_liver
+puya_ns_AB_D_liver %>%
+  arrange(desc(padj))  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))->puya_ns_AB_D_liver
+write.table(puya_ns_AB_D_liver, '/Users/kararyan/Documents/AP39_Tagseq/puya_ns_AB_D_liver_downsampled.tsv',quote = F, row.names = F,sep = '\t' )
+
+puya_ns_AB_D_liver %>%
+  filter(gene.name == 'sqrdl')
+```
+
+```{r gill results}
+padj_cutoff <- 0.05
+lfc_cutoff <- 0
+
+up_puya_s <- puya_s_AB_D_liver  %>% filter(padj < padj_cutoff, log2FoldChange > lfc_cutoff) %>% pull(gene)
+  
+down_puya_s <- puya_s_AB_D_liver  %>% filter(padj < padj_cutoff, log2FoldChange < lfc_cutoff) %>% pull(gene)
+
+up_puya_ns <- puya_ns_AB_D_liver  %>% filter(padj < padj_cutoff, log2FoldChange > lfc_cutoff) %>% pull(gene)
+  
+down_puya_ns <- puya_ns_AB_D_liver  %>% filter(padj < padj_cutoff, log2FoldChange < lfc_cutoff) %>% pull(gene)
+
+up_taco_s <- Taco_s_AB_D_liver  %>% filter(padj < padj_cutoff, log2FoldChange > lfc_cutoff) %>% pull(gene)
+  
+down_taco_s <- Taco_s_AB_D_liver %>% filter(padj < padj_cutoff, log2FoldChange < lfc_cutoff) %>% pull(gene)
+
+up_taco_ns <- Taco_ns_AB_D_liver  %>% filter(padj < padj_cutoff, log2FoldChange > lfc_cutoff) %>% pull(gene)
+  
+down_taco_ns <- Taco_ns_AB_D_liver  %>% filter(padj < padj_cutoff, log2FoldChange < lfc_cutoff) %>% pull(gene)
+# Create gene lists
+up_list <- list(
+  PuyaS = up_puya_s,
+  TacoS = up_taco_s,
+  PuyaNS = up_puya_ns,
+  TacoNS = up_taco_ns
+)
+
+down_list <- list(
+  PuyaS = down_puya_s,
+  TacoS = down_taco_s,
+  PuyaNS = down_puya_ns,
+  TacoNS = down_taco_ns
+)
+
+down_list
+# Generate Venn diagram for upregulated genes
+venn_up <- venn.diagram(
+  x = up_list,
+  category.names = names(up_list),
+  filename = NULL,
+ # fill = c("red", "orange", "tomato"),
+  alpha = 0.5,
+  cex = 1.2,
+  fontface = "bold",
+  cat.cex = 1.2,
+  cat.fontface = "bold",
+  main = "Upregulated Genes"
+)
+grid.newpage()
+grid.draw(venn_up)
+
+```
+
+
+```{r gill results}
+# Generate Venn diagram for downregulated genes
+venn_down <- venn.diagram(
+  x = down_list,
+  category.names = names(down_list),
+  filename = NULL,
+ # fill = c("dodgerblue", "skyblue", "steelblue"),
+  alpha = 0.5,
+  cex = 1.2,
+  fontface = "bold",
+  cat.cex = 1.2,
+  cat.fontface = "bold",
+  main = "Downregulated Genes"
+)
+grid.newpage()
+venn_down_liver<- grid.draw(venn_down)
+venn_down_liver
+```
+
+
+
+## Enrichment 
+```{r}
+ItemsList <- venn(down_list, show.plot = FALSE)
+Taco_ns_AB_D_liver
+lengths(attributes(ItemsList)$intersections)
+list_down<- attributes(ItemsList)$intersections$`PuyaS:TacoS:PuyaNS:TacoNS`
+genes<- as.data.frame(list_down)
+Taco_ns_AB_D_liver %>%
+  inner_join(genes, by = c("gene" = "list_down")) -> liver_down
+
+ItemsList <- venn(up_list, show.plot = FALSE)
+lengths(attributes(ItemsList)$intersections)
+list_up<- attributes(ItemsList)$intersections$`PuyaS:TacoS:PuyaNS:TacoNS`
+genes<- as.data.frame(list_up)
+Taco_ns_AB_D_liver %>%
+  inner_join(genes, by = c("gene" = "list_up")) -> liver_up
+
+rbind(liver_up, liver_down) -> liver_genes_forground
+
+liver_genes_forground<- na.omit(liver_genes_forground)
+liver_genes_forground
+
+genes <- liver_genes_forground$Unprot
+
+genes %>%
+  dplyr::select(Uniprot)
+# Name the vector
+genes <- liver_genes_forground$Uniprot
+
+# omit NA values
+genes <- na.omit(genes)
+
+library(org.Hs.eg.db, character.only = TRUE)
+
+go_enrich <- enrichGO(gene = genes,
+                      universe = Taco_ns_AB_D_liverA$Uniprot,
+                      OrgDb = org.Hs.eg.db::org.Hs.eg.db, 
+                      keyType = 'UNIPROT',
+                      readable = T,
+                      ont = "ALL",
+                      pAdjustMethod = "fdr",
+                      minGSSize = 2, 
+                      pvalueCutoff = 0.05)
+
+go_enrich
+go_enrich$Description 
+pdf('/Users/kararyan/Documents/AP39_Tagseq/shared_liver_ancestral.pdf', width = 6, height = 8)
+dotplot(go_enrich, showCategory=20)
+cnetplot(go_enrich)
+```
+
+
+```{r}
+
+ItemsList <- venn(down_list, show.plot = FALSE)
+
+lengths(attributes(ItemsList)$intersections)
+list_down_s<- attributes(ItemsList)$intersections$`PuyaS:TacoS`
+genes_s<- as.data.frame(list_down_s)
+Taco_ns_AB_D_liver %>%
+  inner_join(genes_s, by = c("gene" = "list_down_s")) -> liver_down_s
+
+ItemsList <- venn(up_list, show.plot = FALSE)
+lengths(attributes(ItemsList)$intersections)
+list_up_s<- attributes(ItemsList)$intersections$`PuyaS:TacoS`
+genes_s<- as.data.frame(list_up_s)
+Taco_ns_AB_D_liver %>%
+  inner_join(genes_s, by = c("gene" = "list_up_s")) -> liver_up_s
+
+ItemsList <- venn(down_list, show.plot = FALSE)
+lengths(attributes(ItemsList)$intersections)
+list_down_ns<- attributes(ItemsList)$intersections$`PuyaNS:TacoNS`
+genes_ns<- as.data.frame(list_down_ns)
+Taco_ns_AB_D_liver %>%
+  inner_join(genes_ns, by = c("gene" = "list_down_ns")) -> liver_down_ns
+
+ItemsList <- venn(up_list, show.plot = FALSE)
+lengths(attributes(ItemsList)$intersections)
+list_up_ns<- attributes(ItemsList)$intersections$`PuyaNS:TacoNS`
+genes_ns<- as.data.frame(list_up_ns)
+Taco_ns_AB_D_liver %>%
+  inner_join(genes_ns, by = c("gene" = "list_up_ns")) -> liver_up_ns
+
+liver_list <- list(
+  down_ancestral = liver_down,
+  up_ancestral = liver_up,
+  down_sulfide = liver_down_s$Uniprot,
+  up_sulfide = liver_up_s$Uniprot,
+  down_nonsulfide = liver_down_ns$Uniprot,
+  up_nonsulfide = liver_up_ns$Uniprot
+)
+liver_down
+liver_df <- bind_rows(
+  tibble(UNIPROT = liver_down$Uniprot, group = "ancestral", direction = "down"),
+  tibble(UNIPROT = liver_up$Uniprot, group = "ancestral", direction = "up"),
+  tibble(UNIPROT = liver_down_s$Uniprot, group = "sulfide", direction = "down"),
+  tibble(UNIPROT = liver_up_s$Uniprot, group = "sulfide", direction = "up"),
+  tibble(UNIPROT = liver_down_ns$Uniprot, group = "nonsulfide", direction = "down"),
+  tibble(UNIPROT = liver_up_ns$Uniprot, group = "nonsulfide", direction = "up")
+)
+formula_res <- compareCluster(UNIPROT~group+direction, data=liver_df, fun="enrichGO")
+liver_df
+
+formula_res <- compareCluster(
+  UNIPROT ~ group + direction,
+  data = liver_df,
+  universe = Taco_ns_AB_D_liver$Uniprot,
+  fun = "enrichGO",
+  OrgDb = org.Hs.eg.db::org.Hs.eg.db,
+  keyType = "UNIPROT", 
+  pAdjustMethod = "fdr",
+  ont="MF",
+  minGSSize = 2,
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05, pool = F
+)
+
+pdf('/Users/kararyan/Documents/AP39_Tagseq/shared_liver_GO.pdf', width = 10, height = 10)
+dotplot(formula_res)
+
+liver_df_up <- bind_rows(
+  tibble(UNIPROT = liver_up$Uniprot, group = "ancestral", direction = "up"),
+  tibble(UNIPROT = liver_up_s$Uniprot, group = "sulfide", direction = "up"),
+  tibble(UNIPROT = liver_up_ns$Uniprot, group = "nonsulfide", direction = "up")
+)
+
+liver_df_down <- bind_rows(
+  tibble(UNIPROT = liver_down$Uniprot, group = "ancestral", direction = "down"),
+  tibble(UNIPROT = liver_down_s$Uniprot, group = "sulfide", direction = "down"),
+  tibble(UNIPROT = liver_down_ns$Uniprot, group = "nonsulfide", direction = "down"),
+)
+
+formula_res_up <- compareCluster(
+  UNIPROT ~ group,
+  data = liver_df_up,
+  universe = puya_s_AB_D_liver$Uniprot,
+  fun = "enrichGO",
+  OrgDb = org.Hs.eg.db::org.Hs.eg.db,
+  keyType = "UNIPROT", 
+  pAdjustMethod = "fdr",
+  ont="ALL",
+  minGSSize = 5,
+  pvalueCutoff = 0.05,
+  pool = F
+)
+
+dotplot(formula_res_up)
+head(formula_res_up, n = 500)
+```
+
+
+```{r}
+Taco_s_AB_D_liver %>%
+  filter(diffexpressed == "Up") -> Taco_s_AB_D_liver_up
+Taco_s_AB_D_liver %>%
+  filter(diffexpressed == "Down") -> Taco_s_AB_D_liver_down
+
+Taco_ns_AB_D_liver %>%
+  filter(diffexpressed == "Up") -> Taco_ns_AB_D_liver_up
+Taco_ns_AB_D_liver %>%
+  filter(diffexpressed == "Down") -> Taco_ns_AB_D_liver_down
+
+puya_s_AB_D_liver %>%
+  filter(diffexpressed == "Up") -> puya_s_AB_D_liver_up
+puya_s_AB_D_liver %>%
+  filter(diffexpressed == "Down") -> puya_s_AB_D_liver_down
+
+puya_ns_AB_D_liver %>%
+  filter(diffexpressed == "Up") -> puya_ns_AB_D_liver_up
+puya_ns_AB_D_liver %>%
+  filter(diffexpressed == "Down") -> puya_ns_AB_D_liver_down
+
+liver_df <- bind_rows(
+  tibble(UNIPROT = Taco_s_AB_D_liver_up$Uniprot, group = "taco_s", direction = "up"),
+  tibble(UNIPROT = Taco_s_AB_D_liver_down$Uniprot, group = "taco_s", direction = "down"),
+  tibble(UNIPROT = Taco_ns_AB_D_liver_up$Uniprot, group = "taco_ns", direction = "up"),
+  tibble(UNIPROT = Taco_ns_AB_D_liver_down$Uniprot, group = "taco_ns", direction = "down"),
+  tibble(UNIPROT = puya_s_AB_D_liver_up$Uniprot, group = "puya_s", direction = "up"),
+  tibble(UNIPROT = puya_s_AB_D_liver_down$Uniprot, group = "puya_s", direction = "down"),
+  tibble(UNIPROT = puya_ns_AB_D_liver_up$Uniprot, group = "puya_ns", direction = "up"),
+  tibble(UNIPROT = puya_ns_AB_D_liver_down$Uniprot, group = "puya_ns", direction = "down"),
+)
+
+formula_res <- compareCluster(
+  UNIPROT ~ group + direction,
+  data = liver_df,
+  universe = Taco_ns_AB_D_liver$Uniprot,
+  fun = "enrichGO",
+  OrgDb = org.Hs.eg.db::org.Hs.eg.db,
+  keyType = "UNIPROT", 
+  pAdjustMethod = "BH",
+  ont="BP",
+  minGSSize = 5,
+  pvalueCutoff = 0.0001,
+  qvalueCutoff = 0.0001, pool = F
+)
+dotplot(formula_res)
+
+```
+
+
+
+
+
+
+```{r}
+
+Taco_s_AB_D_liver_rmna <- na.omit(Taco_s_AB_D_liver)
+Taco_s_AB_D_liver_rmna <- unique(Taco_s_AB_D_liver_rmna$Uniprot)
+
+unique(Taco_s_AB_D_liver_rmna)
+
+taco_s_liver_ap39_enrich <- Taco_s_AB_D_liver_rmna$log2FoldChange 
+Taco_s_AB_D_liver_rmna
+names(taco_s_liver_ap39_enrich) <- Taco_s_AB_D_liver_rmna$Uniprot
+
+taco_s_liver_ap39_enrich <- na.omit(taco_s_liver_ap39_enrich)
+
+Taco_s_AB_D_liver_DE <- sort(Taco_s_AB_D_liver_DE, decreasing = TRUE)
+deg_results_list_taco_s
+
+
+taco_s_liver_ap39_enrich
+gse_taco_s <- gseGO(gene = taco_s_liver_ap39_enrich,
+             ont ="ALL", 
+             keyType = "UNIPROT", 
+             minGSSize = 3, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = org.Hs.eg.db, 
+             pAdjustMethod = "BH")
+
+
+deg_results_list_taco_s
+
+enrichGO()
+
+require(DOSE)
+dotplot(gse_taco_s, showCategory=10, split=".sign") + facet_grid(.~.sign)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Liver PBS vs Control
+
+```{r liver results}
+# Taco S A vs C 
+Taco_s_A_B_liver <- results(dds_liver, contrast = taco_s_pbs - taco_s_con) 
+sum(Taco_s_A_B_liver$padj < 0.05, na.rm=T)
+
+# Taco NS A vs C 
+Taco_ns_A_B_liver <- results(dds_liver, contrast = taco_ns_pbs - taco_ns_con ) 
+sum(Taco_ns_A_B_liver$padj < 0.05, na.rm=T)
+
+# puya S A vs C 
+puya_s_A_B_liver <- results(dds_liver, contrast = puya_s_pbs - puya_s_con ) 
+sum(puya_s_A_B_liver$padj < 0.05, na.rm=T)
+
+# puya NS A vs C 
+puya_ns_A_B_liver <- results(dds_liver, contrast = puya_ns_pbs - puya_ns_con ) 
+sum(puya_ns_A_B_liver$padj < 0.05, na.rm=T)
+
+
+101 + 40 + 3 + 76 
+
+220 / 4
+```
+
+
+
+```{r ecotype liver}
+# Taco NS vs Scontrol
+Taco_s_taco_ns_AB <- results(dds_liver, contrast = ((taco_s_con+ taco_s_pbs)/2) - ((taco_ns_con+ taco_ns_pbs)/2)) 
+sum(Taco_s_taco_ns_AB$padj < 0.05, na.rm=T)
+
+# make the results a data frame
+Taco_s_taco_ns_AB  <- as.data.frame(Taco_s_taco_ns_AB )
+# make a column of the gene names 
+Taco_s_taco_ns_AB$gene <- rownames(Taco_s_taco_ns_AB )
+# join with annotations 
+Taco_s_taco_ns_AB  %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->Taco_s_taco_ns_AB 
+Taco_s_taco_ns_AB  %>%
+  arrange(padj)  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No"))->Taco_s_taco_ns_AB 
+Taco_s_taco_ns_AB$diffexpressed <- as.factor(Taco_s_taco_ns_AB$diffexpressed) 
+summary(Taco_s_taco_ns_AB)
+#write.table(Taco_s_taco_ns_AB, '/Users/kararyan/Desktop/Tagseq_exposure/tables2/taco_A_ns_s.tsv',quote = F, row.names = F,sep = '\t' )
+```
+
+
+```{r ecotype liver}
+# puya ecotype liverr
+puya_s_puya_ns_AB<- results(dds_liver, contrast = ((puya_s_con+ puya_s_pbs)/2) - ((puya_ns_con + puya_ns_pbs)/2)) 
+sum(puya_s_puya_ns_AB$padj < 0.05, na.rm=T)
+
+
+# make the results a data frame
+puya_s_puya_ns_AB  <- as.data.frame(puya_s_puya_ns_AB )
+# make a column of the gene names 
+puya_s_puya_ns_AB$gene <- rownames(puya_s_puya_ns_AB )
+# join with annotations 
+puya_s_puya_ns_AB  %>% 
+  left_join(Pmex_human,join_by('gene' =='gene.ID')) ->puya_s_puya_ns_AB 
+puya_s_puya_ns_AB  %>%
+  arrange(desc(padj)) ->puya_s_puya_ns_AB 
+
+
+puya_s_puya_ns_AB  %>% 
+  mutate(diffexpressed =
+                     case_when(log2FoldChange < 0 & padj < 0.05 ~ "Down", 
+                               log2FoldChange > 0 & padj < 0.05 ~ "Up",
+                               TRUE ~ "No")) -> puya_s_puya_ns_AB
+ puya_s_puya_ns_AB$diffexpressed <- as.factor(puya_s_puya_ns_AB$diffexpressed)
+summary(puya_s_puya_ns_AB)
+# write.table(puya_s_puya_ns_AB , '/Users/kararyan/Desktop/Tagseq_exposure/tables2/puya_A_ns_s.tsv',quote = F, row.names = F,sep = '\t' )
+puya_s_puya_ns_AB 
+
+puya_s_puya_ns_AB %>%
+  filter(padj < 0.05) -> puya_s_puya_ns_AB_liver_sig
+Taco_s_taco_ns_AB %>%
+  filter(padj < 0.05) -> Taco_s_taco_ns_AB_liver_sig
+
+puya_s_puya_ns_AB_liver_sig %>%
+  inner_join(Taco_s_taco_ns_AB_liver_sig, by = 'gene') %>%
+  select(log2FoldChange.x, log2FoldChange.y, gene, Hugo_human.x,Protein.annotations.x )
+```
+
+Make PCAs for figure 1
+
+```{r}
+anno
+anno %>%
+  filter(tissue =='gill' & tube.id != 'EFR22.080' & treatment != "AP39.half") %>%
+  select(tube.id, pop, treatment, group, mass, drainage)-> gill_meta
+
+# Set up DESeq2 dataset
+dds_gill <- DESeqDataSetFromMatrix(countData = gill_counts_matrix,
+                              colData = gill_anno_matrix,
+                              design = ~ mass + pop + treatment)
+
+# Run DESeq2
+dds_gill <- DESeq(dds_gill)
+
+gill_anno<- as.data.frame(gill_anno_matrix)
+# Subset samples (change condition as needed)
+gill_anno_matrix
+subset_condition <- gill_anno$drainage == "puya"  # example condition
+dds_subset <- dds_gill[, subset_condition]
+dds_subset
+# Variance stabilizing transformation on subset
+vsd_subset <- vst(dds_subset)
+  
+# PCA plot data for subset
+pcaData_subset <- plotPCA(vsd_subset, intgroup = c("treatment", "pop"), returnData = TRUE, ntop = 100)
+percentVar <- round(100 * attr(pcaData_subset, "percentVar"))
+
+# Plot PCA
+pca_plot_gill_puya <- ggplot(pcaData_subset, aes(x = PC1, y = PC2, color = treatment, shape = pop)) +
+  geom_point(size = 3, aes(fill = treatment)) +
+  scale_shape_manual(values = c(0, 17, 15, 2)) +
+  scale_color_manual(values = c('gold', 'skyblue', 'skyblue')) +
+  scale_fill_manual(values = gill_meta) +  # Ensure `gill_meta` still applies to the subset
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme_minimal() +
+  ggtitle("Gill PCA (Subset), n = 150")
+
+# Print plot
+print(pca_plot_gill_taco)
+print(pca_plot_gill_puya)
+
+
+```
+
+```{r}
+library(ggpubr)
+fig1_pca<- ggarrange(gill_PCA, liver_PCA, ncol=2,  common.legend = TRUE, legend="top")
+pdf("/Users/kararyan/Documents/AP39_Tagseq/Figure1.pdf", height = 5, width = 9)
+fig1_pca
+
+```
+

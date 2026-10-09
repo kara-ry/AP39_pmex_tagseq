@@ -1,0 +1,23 @@
+#!/bin/bash
+#SBATCH --partition=popgenom,kamiak,cas
+#SBATCH --job-name=fastqc-tagseq
+#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.err
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=kara.ryan@wsu.edu
+#SBATCH --time=7-00:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=12GB
+
+# export SINGULARITY_CACHEDIR=/weka/data/lab/kelley/projects/rawdata/pmex/pmex_tagseq/.singularity_cache/
+# module add singularity
+module load fastqc
+output=/weka/data/lab/kelley/projects/pmex/tagSeq/01-quality-control/01-fastqc/02-mergedreads
+
+for file in /weka/data/lab/kelley/projects/pmex/tagSeq/00-input-data/01-merged-fastq/merged_reads/*.gz
+do 
+  fastqc -t 2 -o ${output} ${file}
+done

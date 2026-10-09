@@ -1,0 +1,30 @@
+#!/bin/bash
+#SBATCH --partition=cas,popgenom,cahnrs
+#SBATCH --job-name=STAR-tagseq
+#SBATCH --output=out/Star%x_%j.out
+#SBATCH --error=err/Star%x_%j.err
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=kara.ryan@wsu.edu
+#SBATCH --time=7-00:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --array=1-177:1
+
+module load singularity
+
+# ls /weka/data/lab/kelley/projects/pmex/tagSeq/01-quality-control/02-trim/trimmed_reads/*.fastq > trimmed_reads_paths
+# cat trimmed_reads_paths | awk -F "/" '{print $12}' | awk -F "_" '{print $1}' > samples
+# paste trimmed_reads_paths samples > mapping_array
+
+# set the variable fastq as the first coumn in the array table
+fastq=$(sed -n ''$SLURM_ARRAY_TASK_ID'p' mapping_array | awk '{print $1}')
+# set the variable sample as the second column of the array table 
+sample=$(sed -n ''$SLURM_ARRAY_TASK_ID'p' mapping_array | awk '{print $2}')
+
+singularity exec -B ${PWD} https://depot.galaxyproject.org/singularity/star:2.7.9a--h9ee0642_0 \
+STAR \
+--genomeDir Pmex.indexed/ \
+--readFilesIn $fastq \
+--runThreadN 8 \
+--outSAMtype BAM SortedByCoordinate \
+--quantMode GeneCounts \
+--outFileNamePrefix star_out/${sample}_

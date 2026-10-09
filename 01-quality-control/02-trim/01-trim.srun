@@ -1,0 +1,38 @@
+#!/bin/bash
+#SBATCH --job-name=TagSeqTrim
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=6GB
+#SBATCH --partition=popgenom,cas,kamiak,cahnrs
+#SBATCH --time=7-00:00:00
+#SBATCH --out=out/TagSeqTrim_%a_%A.out
+#SBATCH --err=err/TagSeqTrim_%a_%A.err
+#SBATCH --array=56
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=kara.ryan@wsu.edu
+
+#######################################
+# Author: Kara Ryan
+# Email: kara.ryan@wsu.edu
+# Scripts modified from https://github.com/z0on/tag-based_RNAseq 
+######################################
+
+# Create a table to run trimming in an array
+# print the absolute paths of the merged fastq reads into a file names paths.txt
+# ls /weka/data/kelley/projects/pmex/tagSeq/00-input-data/01-merged-fastq/merged_reads/*.fastq > paths.txt
+
+# split those paths first by '/' then by '_' to get the sample names and print to a file named samples
+# ls /weka/data/kelley/projects/pmex/tagSeq/00-input-data/01-merged-fastq/merged_reads/*.fastq | awk -F "/" '{print $11}' | awk -F "_" '{print $1}' > samples.txt
+
+# Create a new file that joins paths and samples
+# paste paths.txt samples.txt | column -s $'\t' -t > tagseq_array
+
+# set the variable fastq as the first coumn in the array table
+fastq=$(sed -n ''$SLURM_ARRAY_TASK_ID'p' tagseq_array | awk '{print $1}')
+# set the variable sample as the second column of the array table 
+sample=$(sed -n ''$SLURM_ARRAY_TASK_ID'p' tagseq_array | awk '{print $2}')
+
+# Load cutadapt and perl
+module load cutadapt/2.10 perl/5.28.0
+
+# run tag seq clipper then pipe the results into cutadapt 
+perl tag-based_RNAseq/tagseq_clipper.pl $fastq | cutadapt - -a AAAAAAAA -a AGATCGGAAGAG -q 15 -m 25 -o trimmed_reads/${sample}_trimmed.fastq.gz 
